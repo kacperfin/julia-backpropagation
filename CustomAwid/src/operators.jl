@@ -9,12 +9,11 @@ end
 function adjoint!(z::GraphNode{:add, 2})
   x, y = z.args
   
-  # If x is a matrix (batch) and y is a vector (bias), sum across the batch dimension (dims=2)
   if length(size(x.data)) == 2 && length(size(y.data)) == 1
       x.grad .+= z.grad
-      y.grad .+= vec(sum(z.grad, dims=2)) # vec() forces it back to a 1D vector
+      y.grad .+= vec(sum(z.grad, dims=2))
   else
-      x.grad .+= z.grad
+      x.grad .+= z.grad # 
       y.grad .+= z.grad
   end
   return nothing
@@ -79,12 +78,9 @@ dense(pair :: Pair{Int64, Int64}, activation) =
 function (y::Dense)(x)
   n   = y.insize
   m   = y.outsize
-  B   = size(x.data, 2) # Get batch size B from the flattened input
-  
+  B   = size(x.data, 2)
   W   = GraphNode(randn(m, n) .* 0.01, true) 
   b   = GraphNode(randn(m) .* 0.01, true) 
-  
-  # Initialize the intermediate nodes with the batch size B!
   mul = GraphNode(:mul, (W, x), zeros(m, B))
   add = GraphNode(:add, (mul, b), zeros(m, B))
   return add
@@ -206,7 +202,6 @@ end
 
 function primal!(y::GraphNode{:conv, 2})
   W, x = y.args
-  # Pass data into a function barrier to lock in the types
   _primal_conv!(y.data, W.data, x.data)
   return nothing
 end
@@ -231,7 +226,6 @@ function _primal_conv!(y_data::AbstractArray{T1, 4}, W_data::AbstractArray{T2, 4
                 for di in 1:F_w
                     xi = i + di - 1 - pad_w
                     xj = j + dj - 1 - pad_h
-                    # Calculate padding mathematically instead of allocating arrays
                     if 1 <= xi <= W_in && 1 <= xj <= H_in
                         sum_val += x_data[xi, xj, c_in, b] * W_data[di, dj, c_in, c_out]
                     end
@@ -315,7 +309,7 @@ function _primal_maxpool!(y_data::AbstractArray{T1, 4}, x_data::AbstractArray{T2
     for c in 1:C
       for j in 1:H_out
         for i in 1:W_out
-          max_val = typemin(T2) # Safely handles Float32 or Float64
+          max_val = typemin(T2)
           for dj in 1:w_h
               for di in 1:w_w
                   val = x_data[(i-1)*w_w + di, (j-1)*w_h + dj, c, b]
@@ -373,18 +367,51 @@ end
 dropout(p::Float64) = Dropout(p)
 
 function (y::Dropout)(x)
-  return GraphNode(:dropout, (x,), zeros(size(x.data)))
+  p_node = GraphNode([y.p], false)
+  mask_node = GraphNode(zeros(size(x.data)), false)
+  return GraphNode(:dropout, (p_node, mask_node, x), zeros(size(x.data)))
 end
 
-function primal!(y::GraphNode{:dropout, 1})
-  x, = y.args
-  y.data .= x.data # Przepuszczamy dane bez zmian
+function primal!(y::GraphNode{:dropout, 3}, train::Bool)
+  p_node, mask_node, x = y.args
+  if train
+      p = p_node.data[1]
+      mask_node.data .= rand(size(x.data)...) .> p
+      y.data .= (x.data .* mask_node.data) ./ (1 - p)
+  else
+      y.data .= x.data
+  end
   return nothing
 end
 
-function adjoint!(y::GraphNode{:dropout, 1})
+function adjoint!(y::GraphNode{:dropout, 3})
+  p_node, mask_node, x = y.args
+  p = p_node.data[1]
+  x.grad .+= y.grad .* (mask_node.data ./ (1 - p))
+  return nothing
+end
+
+# Softmax
+
+struct SoftMax <: Operator end 
+softmax() = SoftMax() 
+
+function (y::SoftMax)(x)
+  return GraphNode(:softmax, (x,), zeros(size(x.data)))
+end
+
+function primal!(y::GraphNode{:softmax, 1})
   x, = y.args
-  x.grad .+= y.grad # Przepuszczamy błędy bez zmian
+  xmax = maximum(x.data, dims=1)
+  exp_x = exp.(x.data .- xmax)
+  y.data .= exp_x ./ sum(exp_x, dims=1)
+  return nothing
+end
+
+function adjoint!(y::GraphNode{:softmax, 1})
+  x, = y.args
+  sum_ydy = sum(y.data .* y.grad, dims=1)
+  x.grad .+= y.data .* (y.grad .- sum_ydy)
   return nothing
 end
 
@@ -407,6 +434,8 @@ function primal!(z::GraphNode{:crossentropy, 2})
   z.data[1] = -sum(y.data .* log_probs) / B
   return nothing
 end
+
+primal!(node::GraphNode, train::Bool) = primal!(node)
 
 function adjoint!(z::GraphNode{:crossentropy, 2})
   x, y = z.args

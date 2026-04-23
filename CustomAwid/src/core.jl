@@ -119,14 +119,14 @@ function adjoint!(::GraphWeight) end
 # i inicjalizuje data w GraphNode'ach faktycznymi wartościami, a następnie
 # przechodzi po Vector{GraphNode} i liczy wartości za pomocą funkcji określonych
 # w sekcji Operatory.
-function forward!(order::Vector{GraphNode}, pairs...)
+function forward!(order::Vector{GraphNode}, pairs...; train=true)
   for pair in pairs
     tensor,data = pair
     tensor.data .= data
   end
 
   for node in order
-    primal!(node)
+    primal!(node, train)
   end
 end
 
