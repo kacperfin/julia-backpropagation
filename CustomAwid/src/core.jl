@@ -120,11 +120,13 @@ function adjoint!(::GraphWeight) end
 # przechodzi po Vector{GraphNode} i liczy wartości za pomocą funkcji określonych
 # w sekcji Operatory.
 function forward!(order::Vector{GraphNode}, pairs...; train=true)
+  # Wstrzykiwanie wartości
   for pair in pairs
     tensor,data = pair
     tensor.data .= data
   end
 
+  # Przejście w przód
   for node in order
     primal!(node, train)
   end
@@ -133,7 +135,7 @@ end
 # Funkcja backward! liczy gradient.
 function backward!(order::Vector{GraphNode})
 	seed = last(order)
-	seed.grad .= 1
+	seed.grad .= 1 # Gradient po lossie samym w sobie to 1
 
   for node in reverse(order) # w przeciwnym kierunku niż forward!
     adjoint!(node)
@@ -151,7 +153,15 @@ end
 
 # Wyświetlanie
 import Base: show
-show(io::IO, x::GraphNode{OP, N}) where {OP,N} =
-  print(io, "layer ", OP, " with ", N, " arg(s)")
-show(io::IO, x::GraphWeight) = print(io, "weight")
-show(io::IO, x::GraphTensor) = print(io, "tensor")
+short_id(x) = string(objectid(x), base=16)[1:6]
+get_op(::GraphNode{OP}) where {OP} = OP
+function show(io::IO, x::GraphNode{OP, N}) where {OP, N}
+    args_info = join(["$(get_op(arg))_$(short_id(arg))" for arg in x.args], ", ")
+    if N > 0
+        print(io, "layer ", OP, " (id: ", short_id(x), ") with args: [", args_info, "]")
+    else
+        print(io, "layer ", OP, " (id: ", short_id(x), ")")
+    end
+end
+show(io::IO, x::GraphWeight) = print(io, "weight (id: ", short_id(x), ")")
+show(io::IO, x::GraphTensor) = print(io, "tensor (id: ", short_id(x), ")")
