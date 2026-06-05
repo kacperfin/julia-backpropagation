@@ -47,15 +47,17 @@ end
 
 function primal!(y::GraphNode{:mul, 2})
   W, x = y.args
-  y.data = W.data * x.data # wynik to mnożenie dwóch macierzy lub wektorów
+  # Optymalizacja KM2 - mnożenie w miejscu: mul! liczy W*x prosto do y.data
+  mul!(y.data, W.data, x.data)
   return nothing
 end
 
 function adjoint!(y::GraphNode{:mul, 2})
   W, x = y.args
-  W.grad += y.grad * x.data' # grad W to grad y razy wartość drugiego czynnika mnożenia (x.data)
+  # Optymalizacja KM2 - akumulacja w miejscu: mul!(C, A, B, true, true) liczy C += A*B
   # transpozycje wynikają z kolejności w mnożeniu macierzowym
-  x.grad += W.data' * y.grad
+  mul!(W.grad, y.grad, transpose(x.data), true, true)
+  mul!(x.grad, transpose(W.data), y.grad, true, true)
   return nothing
 end
 
@@ -94,10 +96,12 @@ function (y::Dense)(x)
   n   = y.insize # l. neuronów wejściowych
   m   = y.outsize # l. neuronów wyjściowych
   B   = size(x.data, 2)  # 2. wymiar podanych danych
-  W   = GraphNode(randn(m, n) .* 0.01, true) # warstwa wag
-  b   = GraphNode(randn(m) .* 0.01, true) # warstwa biasów (też :weight)
-  mul = GraphNode(:mul, (W, x), zeros(m, B)) # mnożenie Wx
-  add = GraphNode(:add, (mul, b), zeros(m, B)) # dodawanie Wx + b
+  # Optymalizacja KM2 - inicjalizacja He: randn * sqrt(2/fan_in), fan_in=n (zalecane w FAQ)
+  # Optymalizacja KM2 - Float32 zamiast Float64 (jak cała sieć): mniej pamięci, szybszy BLAS
+  W   = GraphNode(randn(Float32, m, n) .* sqrt(2f0 / n), true) # warstwa wag (He)
+  b   = GraphNode(randn(Float32, m) .* 0.01f0, true) # warstwa biasów (też :weight)
+  mul = GraphNode(:mul, (W, x), zeros(Float32, m, B)) # mnożenie Wx
+  add = GraphNode(:add, (mul, b), zeros(Float32, m, B)) # dodawanie Wx + b
   return add
 end
 
@@ -107,7 +111,7 @@ struct Sigmoid <: Operator end
 sigmoid() = Sigmoid() 
 
 function (y::Sigmoid)(x)
-  return GraphNode(:sigmoid, (x,), zeros(size(x.data)))
+  return GraphNode(:sigmoid, (x,), zeros(Float32, size(x.data)))
 end
 
 function primal!(y::GraphNode{:sigmoid, 1})
@@ -130,7 +134,7 @@ struct ReLU <: Operator end
 relu() = ReLU() 
 
 function (y::ReLU)(x)
-  return GraphNode(:relu, (x,), zeros(size(x.data)))
+  return GraphNode(:relu, (x,), zeros(Float32, size(x.data)))
 end
 
 function primal!(y::GraphNode{:relu, 1})
@@ -154,7 +158,7 @@ struct BinaryCrossEntropy <: Loss end # BinaryCrossEntropy należy do Loss
 bce(output, target) = BinaryCrossEntropy()(output, target) # skrócenie zapisu
 
 function (E::BinaryCrossEntropy)(x, y)
-  return GraphNode(:bce, (x, y), zeros(1))
+  return GraphNode(:bce, (x, y), zeros(Float32, 1))
 end
 
 function primal!(z::GraphNode{:bce, 2})
@@ -183,7 +187,7 @@ flatten() = Flatten()
 function (y::Flatten)(x)
   features = prod(size(x.data)[1:end-1]) # wylicza liczbę komórek poza ostatnim wymiarem (batch)
   B = size(x.data)[end] # B = batchsize
-  return GraphNode(:flatten, (x,), zeros(features, B))
+  return GraphNode(:flatten, (x,), zeros(Float32, features, B))
 end
 
 function primal!(y::GraphNode{:flatten, 1})
@@ -220,19 +224,22 @@ function (y::Conv)(x)
   # padding dodany po obu stronach - lewej i prawej, odjąć rozmiar filtra
   W_out = W_in + 2*y.pad - y.filter_size[1] + 1 # szer. wyjściowa
   H_out = H_in + 2*y.pad - y.filter_size[2] + 1 # wys. wyjściowa
-  
+  F_w, F_h = y.filter_size
+  C_in, C_out = y.in_channels, y.out_channels
+
   # Warstwa z wagami w kształcie: szer. filtra, wys. filtra, kanały wejściowe, kanały wyjściowe
-  W_shape = (y.filter_size[1], y.filter_size[2], y.in_channels, y.out_channels)
-  W = GraphNode(randn(Float32, W_shape) .* 0.1, true) # losowo inicjalizowane wagi filtra
-  
-  return GraphNode(:conv, (W, x), zeros(Float32, W_out, H_out, y.out_channels, B))
+  # Optymalizacja KM2 - inicjalizacja He: randn * sqrt(2/fan_in), fan_in=F_w*F_h*C_in (FAQ)
+  fan_in = F_w * F_h * C_in
+  W = GraphNode(randn(Float32, F_w, F_h, C_in, C_out) .* sqrt(2f0 / fan_in), true)
+
+  # Optymalizacja KM2 - bufor z paddingiem (raz), pętla bez warunków brzegowych -> @turbo
+  buf = GraphNode(zeros(Float32, W_in + 2*y.pad, H_in + 2*y.pad, C_in, B), false)
+
+  return GraphNode(:conv, (W, x, buf), zeros(Float32, W_out, H_out, C_out, B))
 end
 
-function primal!(y::GraphNode{:conv, 2})
-  W, x = y.args
-  _primal_conv!(y.data, W.data, x.data)
-  return nothing
-end
+# Naiwne jądro splotu w przód (z KM1). Nieużywane przez sieć - wzorzec odniesienia
+# dla bench_conv.jl (sprawdzenie, że szybka wersja liczy to samo).
 
 function _primal_conv!(y_data::AbstractArray{T1, 4}, W_data::AbstractArray{T2, 4}, x_data::AbstractArray{T3, 4}) where {T1, T2, T3}
   F_w, F_h, C_in, C_out = size(W_data) # wymiary filtra
@@ -269,12 +276,7 @@ function _primal_conv!(y_data::AbstractArray{T1, 4}, W_data::AbstractArray{T2, 4
   end
 end
 
-function adjoint!(y::GraphNode{:conv, 2})
-  W, x = y.args
-  _adjoint_conv!(y.grad, W.grad, W.data, x.grad, x.data)
-  return nothing
-end
-
+# Naiwne jądro splotu w tył (z KM1) - również tylko wzorzec odniesienia.
 function _adjoint_conv!(y_grad::AbstractArray{T1, 4}, W_grad::AbstractArray{T2, 4}, W_data::AbstractArray{T2, 4}, x_grad::AbstractArray{T3, 4}, x_data::AbstractArray{T3, 4}) where {T1, T2, T3}
   F_w, F_h, C_in, C_out = size(W_data)
   W_in, H_in, _, B = size(x_data)
@@ -307,6 +309,78 @@ function _adjoint_conv!(y_grad::AbstractArray{T1, 4}, W_grad::AbstractArray{T2, 
       end
     end
   end
+end
+
+# Optymalizacja KM2 - szybki splot: bufor z paddingiem + @turbo (liczy to samo, szybciej)
+
+# Kopiuje obraz x do środka bufora z paddingiem. Brzeg bufora pozostaje zerowy
+# (nigdy go nie dotykamy), więc nie trzeba go zerować co przebieg.
+function _pad_into!(xp::AbstractArray{T1, 4}, x::AbstractArray{T2, 4}) where {T1, T2}
+  W_in, H_in, C, B = size(x)
+  pw = (size(xp, 1) - W_in) ÷ 2
+  ph = (size(xp, 2) - H_in) ÷ 2
+  @inbounds for b in 1:B, c in 1:C, j in 1:H_in, i in 1:W_in
+    xp[i + pw, j + ph, c, b] = x[i, j, c, b]
+  end
+  return nothing
+end
+
+# Przepisuje gradient ze środka bufora z paddingiem z powrotem do x.grad.
+function _unpad_into!(xg::AbstractArray{T1, 4}, xpg::AbstractArray{T2, 4}) where {T1, T2}
+  W_in, H_in, C, B = size(xg)
+  pw = (size(xpg, 1) - W_in) ÷ 2
+  ph = (size(xpg, 2) - H_in) ÷ 2
+  @inbounds for b in 1:B, c in 1:C, j in 1:H_in, i in 1:W_in
+    xg[i, j, c, b] += xpg[i + pw, j + ph, c, b]
+  end
+  return nothing
+end
+
+# Forward: obraz jest już w buforze z paddingiem, więc indeks i+di-1 nigdy nie
+# wychodzi poza tablicę - brak warunku w pętli pozwala @turbo zwektoryzować.
+function _primal_conv_loop!(y_data::AbstractArray{T1, 4}, W_data::AbstractArray{T2, 4}, xp_data::AbstractArray{T3, 4}) where {T1, T2, T3}
+  F_w, F_h, C_in, C_out = size(W_data)
+  W_out, H_out, _, B = size(y_data)
+  @turbo for b in 1:B, c_out in 1:C_out, j in 1:H_out, i in 1:W_out
+    acc = zero(T1)
+    for c_in in 1:C_in, dj in 1:F_h, di in 1:F_w
+      acc += xp_data[i + di - 1, j + dj - 1, c_in, b] * W_data[di, dj, c_in, c_out]
+    end
+    y_data[i, j, c_out, b] = acc
+  end
+  return nothing
+end
+
+# Backward: rozprowadza gradient na wagi i na bufor wejścia. Tu są zapisy z
+# akumulacją (+=) o nakładających się indeksach, więc nie używamy @turbo (tylko
+# @inbounds). Zachowujemy pomijanie zerowych gradientów (dy == 0).
+function _adjoint_conv_loop!(y_grad::AbstractArray{T1, 4}, W_grad::AbstractArray{T2, 4}, W_data::AbstractArray{T2, 4}, xp_grad::AbstractArray{T3, 4}, xp_data::AbstractArray{T3, 4}) where {T1, T2, T3}
+  F_w, F_h, C_in, C_out = size(W_data)
+  W_out, H_out, _, B = size(y_grad)
+  @inbounds for b in 1:B, c_out in 1:C_out, j in 1:H_out, i in 1:W_out
+    dy = y_grad[i, j, c_out, b]
+    dy == zero(T1) && continue
+    for c_in in 1:C_in, dj in 1:F_h, di in 1:F_w
+      xi = i + di - 1; xj = j + dj - 1
+      W_grad[di, dj, c_in, c_out] += xp_data[xi, xj, c_in, b] * dy
+      xp_grad[xi, xj, c_in, b]    += W_data[di, dj, c_in, c_out] * dy
+    end
+  end
+  return nothing
+end
+
+function primal!(c::GraphNode{:conv, 3})
+  W, x, buf = c.args
+  _pad_into!(buf.data, x.data)            # obraz -> bufor z paddingiem
+  _primal_conv_loop!(c.data, W.data, buf.data)
+  return nothing
+end
+
+function adjoint!(c::GraphNode{:conv, 3})
+  W, x, buf = c.args
+  _adjoint_conv_loop!(c.grad, W.grad, W.data, buf.grad, buf.data)
+  _unpad_into!(x.grad, buf.grad)          # gradient bufora -> x.grad
+  return nothing
 end
 
 # MaxPool
@@ -402,16 +476,19 @@ end
 dropout(p::Float64) = Dropout(p)
 
 function (y::Dropout)(x)
-  p_node = GraphNode([y.p], false) # prawdopodobieństwo wyłączenia
-  mask_node = GraphNode(zeros(size(x.data)), false) # pusta maska do przechowywania wyłączonych komórek
-  return GraphNode(:dropout, (p_node, mask_node, x), zeros(size(x.data)))
+  # Optymalizacja KM2 - Float32 (jak cała sieć): p też Float32, żeby (1-p) nie podbijało do Float64
+  p_node = GraphNode(Float32[y.p], false) # prawdopodobieństwo wyłączenia
+  mask_node = GraphNode(zeros(Float32, size(x.data)), false) # pusta maska do przechowywania wyłączonych komórek
+  return GraphNode(:dropout, (p_node, mask_node, x), zeros(Float32, size(x.data)))
 end
 
 function primal!(y::GraphNode{:dropout, 3}, train::Bool)
   p_node, mask_node, x = y.args
   if train
       p = p_node.data[1] # pobierz prawdopodobieństwo
-      mask_node.data .= rand(size(x.data)...) .> p # zamiana maski na binarną 
+      # Optymalizacja KM2 - rand! losuje maskę wprost do istniejącej tablicy (w miejscu)
+      rand!(mask_node.data)
+      mask_node.data .= mask_node.data .> p # zamiana maski na binarną (w miejscu)
       # Przemnożenie przez maskę (wyłączenie niektórych pikseli) oraz przeskalowanie pozostałych
       # o odwrotność prawdopodobieństwa zachowania neuronu:
       y.data .= (x.data .* mask_node.data) ./ (1 - p)
@@ -435,7 +512,7 @@ struct SoftMax <: Operator end
 softmax() = SoftMax() 
 
 function (y::SoftMax)(x)
-  return GraphNode(:softmax, (x,), zeros(size(x.data)))
+  return GraphNode(:softmax, (x,), zeros(Float32, size(x.data)))
 end
 
 function primal!(y::GraphNode{:softmax, 1})
@@ -462,7 +539,7 @@ struct LogitCrossEntropy <: Loss end
 logitcrossentropy(output, target) = LogitCrossEntropy()(output, target)
 
 function (E::LogitCrossEntropy)(x, y)
-  return GraphNode(:crossentropy, (x, y), zeros(1)) # zwraca tylko jedną liczbę
+  return GraphNode(:crossentropy, (x, y), zeros(Float32, 1)) # zwraca tylko jedną liczbę
 end
 
 function primal!(z::GraphNode{:crossentropy, 2})

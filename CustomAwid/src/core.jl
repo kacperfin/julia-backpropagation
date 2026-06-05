@@ -17,7 +17,10 @@ end
 # na NTuple{N, Int64} automatycznie, aby dopasować się do definicji atrybutu "outsize" Tensora.
 
 function (x::Tensor{N})() where N
-  data = zeros(x.outsize...)
+  # Optymalizacja KM2 - Float32 zamiast domyślnego Float64: cała sieć liczy w pojedynczej
+  # precyzji (2x mniej pamięci na tablicę, szybszy SIMD/@turbo i BLAS). Tu ustawiamy typ
+  # tensora wejściowego, a kolejne warstwy go propagują - dzięki temu cały graf jest Float32.
+  data = zeros(Float32, x.outsize...)
   return GraphNode(data)
 end
 
@@ -52,10 +55,11 @@ function (chain::Chain)(x)
   end
   return node # zwróć uzyskaną wartość
 end
-mutable struct GraphNode{OP, N}
+# Optymalizacja KM2 - parametr typu T daje stabilność typów (koniec z Any), szybszy kod (W08)
+mutable struct GraphNode{OP, N, T}
   args :: NTuple{N, GraphNode}
-  grad
-  data
+  grad :: T
+  data :: T
 end
 
 const GraphWeight = GraphNode{:weight, 0} # Węzeł bez argumentów gdzie OP = :weight
@@ -64,9 +68,9 @@ const GraphTensor = GraphNode{:tensor, 0} # Węzeł bez argumentów gdzie OP = :
 # Konstruktor dla danych jak wagi i tensory (obrazy), czyli nieposiadających argumentów (rodziców):
 function GraphNode(data::T, trainable=false) where T
   if trainable # wagi są trainable
-    return GraphNode{:weight, 0}((), zero(data), data)
+    return GraphNode{:weight, 0, T}((), zero(data), data)
   else # tensory nie są trainable
-    return GraphNode{:tensor, 0}((), zero(data), data)
+    return GraphNode{:tensor, 0, T}((), zero(data), data)
   end
 end
 
@@ -75,7 +79,7 @@ end
 function GraphNode(op::Symbol, args::Tuple, data::T) where T
   N = length(args)
   grad = similar(data)
-  return GraphNode{op, N}(args, grad, data)
+  return GraphNode{op, N, T}(args, grad, data)
 end
 
 # Zwracanie wektora GraphNode'ów w kolejności:
@@ -146,7 +150,8 @@ end
 function optimize!(graph, η)
   for node in graph
 	if node isa GraphWeight
-      node.data .-= η * node.grad
+      # Optymalizacja KM2 - mnożenie w miejscu (.*), bez tablicy tymczasowej
+      node.data .-= η .* node.grad
     end
   end
 end

@@ -1,3 +1,6 @@
 .vscode
 .env
 old/
+reference/data/
+reference/.venv/
+.venv/
